@@ -57,7 +57,7 @@ volatile bit bloqueia_resposta = 0;
 volatile unsigned char nivel = NIVEL_INICIAL;
 volatile unsigned char jokers = JOKERS_INICIAIS;
 volatile unsigned char tempo = TEMPO_INICIAL;
-volatile unsigned int ticks_50ms = 0;
+volatile unsigned char ticks_50ms = 0;
 volatile unsigned char resposta = 0; /* 1=A, 2=B, 3=C, 4=D */
 
 /* Tabela de respostas corretas por nível.
@@ -245,14 +245,17 @@ void isr_timer0(void) interrupt 1 {
     TH0 = TH0_50MS;
     TL0 = TL0_50MS;
 
-    if (contagem_ativa) {
+    if (contagem_ativa) {aaaa
         ticks_50ms++;
-        if (ticks_50ms >= 5000) {
+
+        if (ticks_50ms >= 20) {
             ticks_50ms = 0;
+
             if (tempo > 0) {
                 tempo--;
                 atualiza_displays();
             }
+
             if (tempo == 0) {
                 contagem_ativa = 0;
                 bloqueia_resposta = 1;
