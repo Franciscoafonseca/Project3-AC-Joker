@@ -1,519 +1,578 @@
-;===============================================================================
-; Projeto P3 - Concurso de perguntas de conhecimento (JOKER)
+$MOD51
+
+;==============================================================
+; Projeto P3 - Concurso JOKER
 ; Microcontrolador: AT89S51 / 8051
-; Assembler: Keil A51 / uVision
-; Cristal assumido: 11.0592 MHz
+; Cristal: 12 MHz
 ;
-; Ligacoes conforme enunciado:
-;   P3.2 / INT0  - BSTART, ativo a 0, interrupcao por flanco descendente
-;   P3.3 / INT1  - interrupcao comum dos botoes BA/BB/BC/BD, ativo a 0
-;   P3.4         - BA, resposta A, ativo a 0
-;   P3.5         - BB, resposta B, ativo a 0
-;   P3.6         - BC, resposta C, ativo a 0
-;   P3.7         - BD, resposta D, ativo a 0
-;   P1.0         - Buzzer
-;   P2.7..P2.4  - BCD do display TEMPO
-;   P2.3..P2.0  - BCD do display JOKER
-;   P0.0..P0.7  - LEDs dos niveis 1..8
-;
-; Regras implementadas:
-;   - BSTART inicia a contagem de 5 s.
-;   - Timer0 gera uma base temporal de 50 ms; 20 ticks = 1 s.
-;   - Resposta certa incrementa o nivel.
-;   - Resposta errada com jokers disponiveis decrementa 3 jokers e mantem o nivel.
-;   - Resposta errada sem jokers desce 3 niveis, nunca abaixo do nivel 1.
-;   - Timeout e tratado como resposta errada.
-;   - Ao atingir o nivel 8, todos os LEDs acendem e o buzzer emite 1 kHz por 5 s.
-;
-; Nota:
-;   - Ajustar a tabela RESPOSTAS_CORRETAS de acordo com as perguntas usadas.
-;   - CODIGO_NAO_RESPONDEU = 0AH pode depender do descodificador/simulador.
-;===============================================================================
+; Versão sem espera ativa:
+; - Timer0: interrupção a cada 50 ms
+; - Timer1: interrupção a cada 500 us para buzzer de 1 kHz
+; - INT0: botão START
+; - INT1: botões de resposta
+; - Programa principal entra em Idle Mode
+;==============================================================
 
-; Bits dos portos usados
-BUZZER      BIT     090H        ; P1.0
-BSTART      BIT     0B2H        ; P3.2 / INT0
-INT_BOTOES  BIT     0B3H        ; P3.3 / INT1
-BA          BIT     0B4H        ; P3.4
-BB          BIT     0B5H        ; P3.5
-BC          BIT     0B6H        ; P3.6
-BD          BIT     0B7H        ; P3.7
+;==============================================================
+; Pinos personalizados
+;==============================================================
 
-;-------------------------------------------------------------------------------
-; Constantes
-;-------------------------------------------------------------------------------
-TEMPO_INICIAL       EQU     05H
-JOKERS_INICIAIS     EQU     06H
-NIVEL_INICIAL       EQU     01H
-NIVEL_MAXIMO        EQU     08H
-CODIGO_NAO_RESPONDEU EQU    0AH
+BUZZER  BIT 090H       ; P1.0
 
-; Recarregamento para 50 ms com Fosc = 11.0592 MHz:
-; Timer incrementa a Fosc/12 = 921600 Hz
-; 50 ms = 46080 contagens; 65536 - 46080 = 19456 = 4C00H
-TH_50MS             EQU     04CH
-TL_50MS             EQU     000H
+BSTART  BIT 0B2H       ; P3.2 / INT0
+INTBOT  BIT 0B3H       ; P3.3 / INT1
+BA      BIT 0B4H       ; P3.4
+BB      BIT 0B5H       ; P3.5
+BC      BIT 0B6H       ; P3.6
+BD      BIT 0B7H       ; P3.7
 
-; Recarregamento para cerca de 500 us:
-; 500 us * 921600 Hz = 460.8 contagens; 65536 - 461 = FE33H
-TH_500US            EQU     0FEH
-TL_500US            EQU     033H
+TEMPO_INICIAL        EQU 05H
+JOKERS_INICIAIS      EQU 06H
+NIVEL_INICIAL        EQU 01H
+NIVEL_MAXIMO         EQU 08H
 
-;-------------------------------------------------------------------------------
-; Variaveis em RAM interna
-;-------------------------------------------------------------------------------
-CONTAGEM_ATIVA      BIT     000H
-RESPOSTA_PENDENTE   BIT     001H
-TIMEOUT_PENDENTE    BIT     002H
-BLOQUEIA_RESPOSTA   BIT     003H
+CODIGO_NAO_RESP      EQU 0AH
 
-NIVEL       DATA    030H
-JOKERS      DATA    031H
-TEMPO       DATA    032H
-TICKS_50MS  DATA    033H
-RESPOSTA    DATA    034H
+TH0_50MS             EQU 03CH
+TL0_50MS             EQU 0B0H
 
-;===============================================================================
-; Vetores de interrupcao
-;===============================================================================
-            ORG     0000H
-            LJMP    START
+TH1_500US            EQU 0FEH
+TL1_500US            EQU 00CH
 
-            ORG     0003H       ; INT0 - BSTART
-            LJMP    ISR_START
+TICKS_1S             EQU 20
+TICKS_2S             EQU 40
 
-            ORG     000BH       ; Timer0
-            LJMP    ISR_TIMER0
+; Estados
+EST_PRONTO           EQU 00H
+EST_CONTAGEM         EQU 01H
+EST_ESPERA_LIB       EQU 02H
+EST_DELAY_RESP       EQU 03H
+EST_TIMEOUT_ZERO     EQU 04H
+EST_DELAY_TIMEOUT    EQU 05H
+EST_VITORIA          EQU 06H
 
-            ORG     0013H       ; INT1 - botoes de resposta
-            LJMP    ISR_RESPOSTA
+;---------------- RAM interna ----------------
 
-;===============================================================================
+STATE       DATA 30H
+NIVEL       DATA 31H
+JOKERS      DATA 32H
+TEMPO       DATA 33H
+TICKS50     DATA 34H
+TICKS_EST   DATA 35H
+RESPOSTA    DATA 36H
+BUZZ_L      DATA 37H
+BUZZ_H      DATA 38H
+
+;==============================================================
+; Vetores de interrupção
+;==============================================================
+
+ORG 0000H
+    LJMP START
+
+ORG 0003H
+    LJMP ISR_INT0
+
+ORG 000BH
+    LJMP ISR_TIMER0
+
+ORG 0013H
+    LJMP ISR_INT1
+
+ORG 001BH
+    LJMP ISR_TIMER1
+
+;==============================================================
 ; Programa principal
-;===============================================================================
-            ORG     0030H
+;==============================================================
+
+ORG 0030H
 
 START:
-            MOV     SP,#06FH            ; pilha acima das variaveis
-            LCALL   CONFIGURA_8051
-            LCALL   REINICIA_CONCORRENTE
+    MOV SP, #6FH
+    LCALL CONFIGURA_8051
+    LCALL REINICIA_CONCORRENTE
 
-MAIN_LOOP:
-            ; Se ha resposta pendente, processa-a fora da interrupcao.
-            JNB     RESPOSTA_PENDENTE,CHECK_TIMEOUT
+    SETB EX0
+    SETB EX1
+    SETB ET0
+    SETB ET1
+    SETB EA
 
-            LCALL   PROCESSA_RESPOSTA
-            CLR     RESPOSTA_PENDENTE
+MAIN:
+    ORL PCON, #01H          ; Idle Mode, sem espera ativa
+    SJMP MAIN
 
-            ; So repoe para a proxima pergunta depois do botao ser libertado
-            ; e depois de passarem 2 segundos.
-            LCALL   AGUARDA_LIBERTAR_BOTOES
-            LCALL   DELAY_2S
-            LCALL   PREPARA_PERGUNTA
+;==============================================================
+; Configuração
+;==============================================================
 
-CHECK_TIMEOUT:
-            ; Se o tempo chegou a zero sem resposta, mostra o simbolo de nao
-            ; respondeu e aplica a penalizacao de resposta errada.
-            JNB     TIMEOUT_PENDENTE,MAIN_LOOP
-
-            LCALL   DELAY_1S
-            MOV     TEMPO,#CODIGO_NAO_RESPONDEU
-            LCALL   ATUALIZA_DISPLAYS
-            LCALL   PROCESSA_RESPOSTA_ERRADA
-            LCALL   DELAY_2S
-            LCALL   PREPARA_PERGUNTA
-            CLR     TIMEOUT_PENDENTE
-
-            SJMP    MAIN_LOOP
-
-;===============================================================================
-; Rotina: CONFIGURA_8051
-; Funcao: inicializa portos, timers e interrupcoes.
-;===============================================================================
 CONFIGURA_8051:
-            MOV     P0,#00H             ; LEDs desligados inicialmente
-            MOV     P1,#00H             ; buzzer desligado
-            MOV     P2,#00H             ; displays a zero
-            MOV     P3,#0FFH            ; entradas com pull-up
+    MOV P0, #00H
+    MOV P1, #00H
+    MOV P2, #00H
+    MOV P3, #0FFH
 
-            MOV     TMOD,#011H          ; Timer0 e Timer1 em modo 1, 16 bits
-            MOV     TH0,#TH_50MS
-            MOV     TL0,#TL_50MS
+    MOV TMOD, #11H          ; Timer0 e Timer1 em modo 1
 
-            SETB    IT0                 ; INT0 por flanco descendente
-            SETB    IT1                 ; INT1 por flanco descendente
+    MOV TH0, #TH0_50MS
+    MOV TL0, #TL0_50MS
 
-            SETB    EX0                 ; ativa INT0
-            SETB    EX1                 ; ativa INT1
-            SETB    ET0                 ; ativa interrupcao do Timer0
-            SETB    EA                  ; ativa interrupcoes globais
+    MOV TH1, #TH1_500US
+    MOV TL1, #TL1_500US
 
-            SETB    TR0                 ; Timer0 sempre a correr
-            RET
+    SETB IT0                ; INT0 por flanco descendente
+    SETB IT1                ; INT1 por flanco descendente
 
-;===============================================================================
-; Rotina: ATUALIZA_DISPLAYS
-; Funcao: escreve TEMPO no nibble alto de P2 e JOKER no nibble baixo de P2.
-; Entrada: TEMPO, JOKERS.
-; Altera: A, R7.
-;===============================================================================
-ATUALIZA_DISPLAYS:
-            MOV     A,TEMPO
-            ANL     A,#0FH
-            SWAP    A
-            ANL     A,#0F0H
-            MOV     R7,A                ; R7 = TEMPO << 4
+    SETB TR0                ; Timer0 sempre ativo
+    CLR TR1                 ; Timer1 só na vitória
 
-            MOV     A,JOKERS
-            ANL     A,#0FH
-            ORL     A,R7
-            MOV     P2,A
-            RET
+    RET
 
-;===============================================================================
-; Rotina: ATUALIZA_LEDS
-; Funcao: acende o LED correspondente ao nivel atual.
-;         Se NIVEL >= 8, acende apenas LED8; a rotina de vitoria acende todos.
-; Entrada: NIVEL.
-; Altera: A, R7.
-;===============================================================================
-ATUALIZA_LEDS:
-            MOV     A,NIVEL
-            CLR     C
-            SUBB    A,#NIVEL_MAXIMO
-            JNC     LED_NIVEL8          ; NIVEL >= 8
+;==============================================================
+; Reinício do concorrente
+;==============================================================
 
-            MOV     A,#01H              ; LED1
-            MOV     R7,NIVEL
-            DEC     R7                  ; numero de deslocamentos = nivel - 1
-            JZ      LED_ESCREVE
-
-LED_SHIFT:
-            RL      A
-            DJNZ    R7,LED_SHIFT
-
-LED_ESCREVE:
-            MOV     P0,A
-            RET
-
-LED_NIVEL8:
-            MOV     P0,#080H            ; LED8
-            RET
-
-;===============================================================================
-; Rotina: REINICIA_CONCORRENTE
-; Funcao: repoe o sistema para novo concorrente.
-;===============================================================================
 REINICIA_CONCORRENTE:
-            CLR     CONTAGEM_ATIVA
-            CLR     RESPOSTA_PENDENTE
-            CLR     TIMEOUT_PENDENTE
-            CLR     BLOQUEIA_RESPOSTA
+    MOV STATE, #EST_PRONTO
 
-            MOV     NIVEL,#NIVEL_INICIAL
-            MOV     JOKERS,#JOKERS_INICIAIS
-            MOV     TEMPO,#TEMPO_INICIAL
-            MOV     TICKS_50MS,#00H
-            MOV     RESPOSTA,#00H
-            CLR     BUZZER
+    MOV NIVEL, #NIVEL_INICIAL
+    MOV JOKERS, #JOKERS_INICIAIS
+    MOV TEMPO, #TEMPO_INICIAL
+    MOV RESPOSTA, #00H
 
-            LCALL   ATUALIZA_LEDS
-            LCALL   ATUALIZA_DISPLAYS
-            RET
+    MOV TICKS50, #00H
+    MOV TICKS_EST, #00H
 
-;===============================================================================
-; Rotina: PREPARA_PERGUNTA
-; Funcao: repoe tempo e flags para uma nova pergunta. A contagem so inicia com
-;         novo BSTART.
-;===============================================================================
+    MOV BUZZ_L, #00H
+    MOV BUZZ_H, #00H
+
+    CLR TR1
+    CLR BUZZER
+
+    LCALL ATUALIZA_LEDS
+    LCALL ATUALIZA_DISPLAYS
+
+    RET
+
+;==============================================================
+; Preparação de nova pergunta
+;==============================================================
+
 PREPARA_PERGUNTA:
-            MOV     TEMPO,#TEMPO_INICIAL
-            MOV     TICKS_50MS,#00H
-            MOV     RESPOSTA,#00H
+    MOV TEMPO, #TEMPO_INICIAL
+    MOV RESPOSTA, #00H
 
-            CLR     RESPOSTA_PENDENTE
-            CLR     TIMEOUT_PENDENTE
-            CLR     BLOQUEIA_RESPOSTA
+    MOV TICKS50, #00H
+    MOV TICKS_EST, #00H
 
-            LCALL   ATUALIZA_DISPLAYS
-            RET
+    LCALL ATUALIZA_DISPLAYS
 
-;===============================================================================
-; Rotina: PROCESSA_RESPOSTA
-; Funcao: compara RESPOSTA com a tabela de respostas corretas.
-;===============================================================================
-PROCESSA_RESPOSTA:
-            MOV     A,NIVEL
-            DEC     A                   ; indice = nivel - 1
-            MOV     DPTR,#RESPOSTAS_CORRETAS
-            MOVC    A,@A+DPTR           ; A = resposta correta
+    RET
 
-            CJNE    A,RESPOSTA,RESP_ERRADA
-            LCALL   PROCESSA_RESPOSTA_CERTA
-            RET
+;==============================================================
+; Atualização dos displays
+; P2.7..P2.4 = TEMPO
+; P2.3..P2.0 = JOKER
+;==============================================================
 
-RESP_ERRADA:
-            LCALL   PROCESSA_RESPOSTA_ERRADA
-            RET
+ATUALIZA_DISPLAYS:
+    MOV A, TEMPO
+    ANL A, #0FH
+    SWAP A
+    ANL A, #0F0H
+    MOV R7, A
 
-;===============================================================================
-; Rotina: PROCESSA_RESPOSTA_CERTA
-; Funcao: incrementa nivel. Se atingir o nivel 8, faz vitoria.
-;===============================================================================
-PROCESSA_RESPOSTA_CERTA:
-            MOV     A,NIVEL
-            CJNE    A,#NIVEL_MAXIMO,CERTA_TESTA_MENOR
-            SJMP    CERTA_VERIFICA_VITORIA
+    MOV A, JOKERS
+    ANL A, #0FH
+    ORL A, R7
 
-CERTA_TESTA_MENOR:
-            JNC     CERTA_VERIFICA_VITORIA     ; NIVEL > 8, protecao
-            INC     NIVEL
-            LCALL   ATUALIZA_LEDS
+    MOV P2, A
+    RET
 
-CERTA_VERIFICA_VITORIA:
-            MOV     A,NIVEL
-            CLR     C
-            SUBB    A,#NIVEL_MAXIMO
-            JC      CERTA_FIM                   ; ainda nao chegou ao nivel 8
+;==============================================================
+; Atualização dos LEDs
+;==============================================================
 
-            MOV     P0,#0FFH                    ; vitoria: todos os LEDs
-            LCALL   BUZZER_VITORIA_5S           ; onda quadrada 1 kHz por 5 s
-            LCALL   REINICIA_CONCORRENTE
+ATUALIZA_LEDS:
+    MOV A, NIVEL
+    CJNE A, #NIVEL_MAXIMO, LED_COMPARA
 
-CERTA_FIM:
-            RET
+    MOV P0, #080H
+    RET
 
-;===============================================================================
-; Rotina: PROCESSA_RESPOSTA_ERRADA
-; Funcao: aplica penalizacao.
-;         - Se JOKERS >= 3: decrementa 3 jokers e mantem nivel.
-;         - Se JOKERS < 3: coloca jokers a 0 e desce 3 niveis, sem baixar de 1.
-;===============================================================================
-PROCESSA_RESPOSTA_ERRADA:
-            MOV     A,JOKERS
-            CLR     C
-            SUBB    A,#03H
-            JC      ERRADA_SEM_JOKERS
+LED_COMPARA:
+    JNC LED_NIVEL_8
 
-            MOV     JOKERS,A
-            SJMP    ERRADA_ATUALIZA
+    MOV A, #01H
+    MOV R7, NIVEL
+    DEC R7
+    JZ LED_GRAVA
 
-ERRADA_SEM_JOKERS:
-            MOV     JOKERS,#00H
+LED_LOOP:
+    RL A
+    DJNZ R7, LED_LOOP
 
-            ; Se nivel < 4, ao descer 3 niveis fica no nivel 1.
-            MOV     A,NIVEL
-            CLR     C
-            SUBB    A,#04H
-            JC      ERRADA_NIVEL1
+LED_GRAVA:
+    MOV P0, A
+    RET
 
-            MOV     A,NIVEL
-            CLR     C
-            SUBB    A,#03H
-            MOV     NIVEL,A
-            SJMP    ERRADA_ATUALIZA
+LED_NIVEL_8:
+    MOV P0, #080H
+    RET
 
-ERRADA_NIVEL1:
-            MOV     NIVEL,#01H
+;==============================================================
+; INT0 - START
+;==============================================================
 
-ERRADA_ATUALIZA:
-            LCALL   ATUALIZA_LEDS
-            LCALL   ATUALIZA_DISPLAYS
-            RET
+ISR_INT0:
+    PUSH ACC
+    PUSH PSW
 
-;===============================================================================
-; Rotina: AGUARDA_LIBERTAR_BOTOES
-; Funcao: espera ate BA/BB/BC/BD e a linha comum INT1 voltarem a 1.
-;===============================================================================
-AGUARDA_LIBERTAR_BOTOES:
-            JNB     BA,AGUARDA_LIBERTAR_BOTOES
-            JNB     BB,AGUARDA_LIBERTAR_BOTOES
-            JNB     BC,AGUARDA_LIBERTAR_BOTOES
-            JNB     BD,AGUARDA_LIBERTAR_BOTOES
-            JNB     INT_BOTOES,AGUARDA_LIBERTAR_BOTOES
-            RET
+    MOV A, STATE
+    JNZ FIM_INT0
 
-;===============================================================================
-; Rotinas de atraso com Timer1
-;===============================================================================
-DELAY_50MS:
-            MOV     TH1,#TH_50MS
-            MOV     TL1,#TL_50MS
-            CLR     TF1
-            SETB    TR1
+    LCALL PREPARA_PERGUNTA
+    MOV STATE, #EST_CONTAGEM
 
-D50_ESPERA:
-            JNB     TF1,D50_ESPERA
+FIM_INT0:
+    POP PSW
+    POP ACC
+    RETI
 
-            CLR     TR1
-            CLR     TF1
-            RET
+;==============================================================
+; INT1 - Resposta A/B/C/D
+;==============================================================
 
-DELAY_1S:
-            MOV     R6,#20
+ISR_INT1:
+    PUSH ACC
+    PUSH PSW
 
-D1S_LOOP:
-            LCALL   DELAY_50MS
-            DJNZ    R6,D1S_LOOP
-            RET
+    MOV A, STATE
+    CJNE A, #EST_CONTAGEM, FIM_INT1
 
-DELAY_2S:
-            LCALL   DELAY_1S
-            LCALL   DELAY_1S
-            RET
-
-DELAY_500US:
-            MOV     TH1,#TH_500US
-            MOV     TL1,#TL_500US
-            CLR     TF1
-            SETB    TR1
-
-D500_ESPERA:
-            JNB     TF1,D500_ESPERA
-
-            CLR     TR1
-            CLR     TF1
-            RET
-
-;===============================================================================
-; Rotina: BUZZER_VITORIA_5S
-; Funcao: gera onda quadrada de cerca de 1 kHz durante 5 s.
-;         10000 semi-periodos de 0,5 ms = 5 s.
-; Altera: R4, R5.
-;===============================================================================
-BUZZER_VITORIA_5S:
-            MOV     R4,#100
-
-BUZ_OUTER:
-            MOV     R5,#100
-
-BUZ_INNER:
-            CPL     BUZZER
-            LCALL   DELAY_500US
-            DJNZ    R5,BUZ_INNER
-            DJNZ    R4,BUZ_OUTER
-
-            CLR     BUZZER
-            RET
-
-;===============================================================================
-; ISR: INT0 / BSTART
-; Funcao: inicia a contagem se nao houver outra acao pendente.
-;===============================================================================
-ISR_START:
-            PUSH    ACC
-            PUSH    PSW
-            PUSH    07H
-
-            JB      CONTAGEM_ATIVA,ISR_START_FIM
-            JB      RESPOSTA_PENDENTE,ISR_START_FIM
-            JB      TIMEOUT_PENDENTE,ISR_START_FIM
-
-            LCALL   PREPARA_PERGUNTA
-            SETB    CONTAGEM_ATIVA
-
-ISR_START_FIM:
-            POP     07H
-            POP     PSW
-            POP     ACC
-            RETI
-
-;===============================================================================
-; ISR: Timer0
-; Funcao: a cada 50 ms incrementa TICKS_50MS. A cada 20 ticks decrementa 1 s.
-;===============================================================================
-ISR_TIMER0:
-            PUSH    ACC
-            PUSH    PSW
-            PUSH    07H
-
-            MOV     TH0,#TH_50MS
-            MOV     TL0,#TL_50MS
-
-            JNB     CONTAGEM_ATIVA,ISR_T0_FIM
-
-            INC     TICKS_50MS
-            MOV     A,TICKS_50MS
-            CJNE    A,#20,ISR_T0_FIM
-
-            MOV     TICKS_50MS,#00H
-
-            MOV     A,TEMPO
-            JZ      ISR_T0_TIMEOUT
-
-            DEC     TEMPO
-            LCALL   ATUALIZA_DISPLAYS
-
-            MOV     A,TEMPO
-            JNZ     ISR_T0_FIM
-
-ISR_T0_TIMEOUT:
-            CLR     CONTAGEM_ATIVA
-            SETB    BLOQUEIA_RESPOSTA
-            SETB    TIMEOUT_PENDENTE
-
-ISR_T0_FIM:
-            POP     07H
-            POP     PSW
-            POP     ACC
-            RETI
-
-;===============================================================================
-; ISR: INT1 / botoes de resposta
-; Funcao: identifica BA/BB/BC/BD e guarda resposta 1..4.
-;===============================================================================
-ISR_RESPOSTA:
-            PUSH    ACC
-            PUSH    PSW
-            PUSH    07H
-
-            JNB     CONTAGEM_ATIVA,ISR_RESP_FIM
-            JB      BLOQUEIA_RESPOSTA,ISR_RESP_FIM
-
-            JNB     BA,RESP_A
-            JNB     BB,RESP_B
-            JNB     BC,RESP_C
-            JNB     BD,RESP_D
-
-            MOV     RESPOSTA,#00H
-            SJMP    RESP_TESTA
+    JNB BA, RESP_A
+    JNB BB, RESP_B
+    JNB BC, RESP_C
+    JNB BD, RESP_D
+    SJMP FIM_INT1
 
 RESP_A:
-            MOV     RESPOSTA,#01H
-            SJMP    RESP_TESTA
+    MOV RESPOSTA, #01H
+    SJMP RESP_OK
 
 RESP_B:
-            MOV     RESPOSTA,#02H
-            SJMP    RESP_TESTA
+    MOV RESPOSTA, #02H
+    SJMP RESP_OK
 
 RESP_C:
-            MOV     RESPOSTA,#03H
-            SJMP    RESP_TESTA
+    MOV RESPOSTA, #03H
+    SJMP RESP_OK
 
 RESP_D:
-            MOV     RESPOSTA,#04H
+    MOV RESPOSTA, #04H
 
-RESP_TESTA:
-            MOV     A,RESPOSTA
-            JZ      ISR_RESP_FIM
+RESP_OK:
+    MOV STATE, #EST_ESPERA_LIB
+    MOV TICKS_EST, #00H
+    LCALL ATUALIZA_DISPLAYS
 
-            CLR     CONTAGEM_ATIVA
-            SETB    BLOQUEIA_RESPOSTA
-            SETB    RESPOSTA_PENDENTE
-            LCALL   ATUALIZA_DISPLAYS        ; mantem visivel o tempo remanescente
+FIM_INT1:
+    POP PSW
+    POP ACC
+    RETI
 
-ISR_RESP_FIM:
-            POP     07H
-            POP     PSW
-            POP     ACC
-            RETI
+;==============================================================
+; Timer0 - base temporal de 50 ms
+;==============================================================
 
-;===============================================================================
-; Tabela de respostas corretas por nivel
-; Exemplo: N1=A, N2=B, N3=C, N4=D, N5=A, N6=B, N7=C, N8=D.
-; Alterar estes valores conforme as perguntas do relatorio/apresentacao.
-;===============================================================================
-RESPOSTAS_CORRETAS:
-            DB      01H,02H,03H,04H,01H,02H,03H,04H
+ISR_TIMER0:
+    PUSH ACC
+    PUSH PSW
 
-            END
+    MOV TH0, #TH0_50MS
+    MOV TL0, #TL0_50MS
+
+    MOV A, STATE
+
+    CJNE A, #EST_CONTAGEM, T0_TESTA_LIB
+    LCALL T0_CONTAGEM
+    SJMP FIM_TIMER0
+
+T0_TESTA_LIB:
+    CJNE A, #EST_ESPERA_LIB, T0_TESTA_DELAY_RESP
+    LCALL T0_ESPERA_LIBERTAR
+    SJMP FIM_TIMER0
+
+T0_TESTA_DELAY_RESP:
+    CJNE A, #EST_DELAY_RESP, T0_TESTA_TIMEOUT_ZERO
+    LCALL T0_DELAY_RESPOSTA
+    SJMP FIM_TIMER0
+
+T0_TESTA_TIMEOUT_ZERO:
+    CJNE A, #EST_TIMEOUT_ZERO, T0_TESTA_DELAY_TIMEOUT
+    LCALL T0_TIMEOUT_ZERO
+    SJMP FIM_TIMER0
+
+T0_TESTA_DELAY_TIMEOUT:
+    CJNE A, #EST_DELAY_TIMEOUT, FIM_TIMER0
+    LCALL T0_DELAY_TIMEOUT
+
+FIM_TIMER0:
+    POP PSW
+    POP ACC
+    RETI
+
+;==============================================================
+; Estado: contagem decrescente
+;==============================================================
+
+T0_CONTAGEM:
+    INC TICKS50
+
+    MOV A, TICKS50
+    CJNE A, #TICKS_1S, T0_CONTAGEM_FIM
+
+    MOV TICKS50, #00H
+
+    MOV A, TEMPO
+    JZ T0_PASSA_TIMEOUT
+
+    DEC TEMPO
+    LCALL ATUALIZA_DISPLAYS
+
+    MOV A, TEMPO
+    JNZ T0_CONTAGEM_FIM
+
+T0_PASSA_TIMEOUT:
+    MOV STATE, #EST_TIMEOUT_ZERO
+    MOV TICKS_EST, #00H
+
+T0_CONTAGEM_FIM:
+    RET
+
+;==============================================================
+; Estado: esperar libertar botões, sem while
+;==============================================================
+
+T0_ESPERA_LIBERTAR:
+    JNB BA, T0_LIB_FIM
+    JNB BB, T0_LIB_FIM
+    JNB BC, T0_LIB_FIM
+    JNB BD, T0_LIB_FIM
+    JNB INTBOT, T0_LIB_FIM
+
+    MOV STATE, #EST_DELAY_RESP
+    MOV TICKS_EST, #00H
+
+T0_LIB_FIM:
+    RET
+
+;==============================================================
+; Estado: esperar 2 s após resposta
+;==============================================================
+
+T0_DELAY_RESPOSTA:
+    INC TICKS_EST
+
+    MOV A, TICKS_EST
+    CJNE A, #TICKS_2S, T0_DELAY_RESP_FIM
+
+    MOV TICKS_EST, #00H
+
+    LCALL PROCESSA_RESPOSTA
+
+    MOV A, STATE
+    CJNE A, #EST_VITORIA, T0_PREPARA_PROXIMA
+    RET
+
+T0_PREPARA_PROXIMA:
+    LCALL PREPARA_PERGUNTA
+    MOV STATE, #EST_PRONTO
+
+T0_DELAY_RESP_FIM:
+    RET
+
+;==============================================================
+; Estado: mostrar 0 durante 1 s após timeout
+;==============================================================
+
+T0_TIMEOUT_ZERO:
+    INC TICKS_EST
+
+    MOV A, TICKS_EST
+    CJNE A, #TICKS_1S, T0_TIMEOUT_ZERO_FIM
+
+    MOV TICKS_EST, #00H
+    MOV TEMPO, #CODIGO_NAO_RESP
+
+    LCALL PROCESSA_RESPOSTA_ERRADA
+
+    MOV STATE, #EST_DELAY_TIMEOUT
+
+T0_TIMEOUT_ZERO_FIM:
+    RET
+
+;==============================================================
+; Estado: manter símbolo sem resposta durante 2 s
+;==============================================================
+
+T0_DELAY_TIMEOUT:
+    INC TICKS_EST
+
+    MOV A, TICKS_EST
+    CJNE A, #TICKS_2S, T0_DELAY_TIMEOUT_FIM
+
+    MOV TICKS_EST, #00H
+
+    LCALL PREPARA_PERGUNTA
+    MOV STATE, #EST_PRONTO
+
+T0_DELAY_TIMEOUT_FIM:
+    RET
+
+;==============================================================
+; Processar resposta
+;==============================================================
+
+PROCESSA_RESPOSTA:
+    MOV A, NIVEL
+    DEC A
+
+    MOV DPTR, #TABELA_RESPOSTAS
+    MOVC A, @A+DPTR
+
+    CJNE A, RESPOSTA, RESPOSTA_ERRADA
+
+    LCALL PROCESSA_RESPOSTA_CERTA
+    RET
+
+RESPOSTA_ERRADA:
+    LCALL PROCESSA_RESPOSTA_ERRADA
+    RET
+
+;==============================================================
+; Resposta certa
+;==============================================================
+
+PROCESSA_RESPOSTA_CERTA:
+    MOV A, NIVEL
+    CJNE A, #NIVEL_MAXIMO, AINDA_NAO_MAXIMO
+    SJMP ATINGIU_VITORIA
+
+AINDA_NAO_MAXIMO:
+    INC NIVEL
+    LCALL ATUALIZA_LEDS
+
+    MOV A, NIVEL
+    CJNE A, #NIVEL_MAXIMO, RESPOSTA_CERTA_FIM
+
+ATINGIU_VITORIA:
+    MOV P0, #0FFH
+    LCALL INICIA_BUZZER
+
+RESPOSTA_CERTA_FIM:
+    RET
+
+;==============================================================
+; Resposta errada ou ausência de resposta
+;==============================================================
+
+PROCESSA_RESPOSTA_ERRADA:
+    MOV A, JOKERS
+    CLR C
+    SUBB A, #03H
+    JC SEM_JOKERS
+
+    MOV JOKERS, A
+    SJMP ERRO_ATUALIZA
+
+SEM_JOKERS:
+    MOV JOKERS, #00H
+
+    MOV A, NIVEL
+    CLR C
+    SUBB A, #04H
+    JC NIVEL_VOLTA_1
+
+    MOV A, NIVEL
+    CLR C
+    SUBB A, #03H
+    MOV NIVEL, A
+    SJMP ERRO_ATUALIZA
+
+NIVEL_VOLTA_1:
+    MOV NIVEL, #01H
+
+ERRO_ATUALIZA:
+    LCALL ATUALIZA_LEDS
+    LCALL ATUALIZA_DISPLAYS
+
+    RET
+
+;==============================================================
+; Iniciar buzzer de vitória
+; 5 s a 1 kHz = 10000 interrupções de 500 us
+; 10000 decimal = 2710H
+;==============================================================
+
+INICIA_BUZZER:
+    MOV STATE, #EST_VITORIA
+
+    MOV BUZZ_H, #027H
+    MOV BUZZ_L, #010H
+
+    CLR BUZZER
+
+    MOV TH1, #TH1_500US
+    MOV TL1, #TL1_500US
+
+    CLR TF1
+    SETB TR1
+
+    RET
+
+;==============================================================
+; Timer1 - buzzer de 1 kHz
+;==============================================================
+
+ISR_TIMER1:
+    PUSH ACC
+    PUSH PSW
+
+    MOV TH1, #TH1_500US
+    MOV TL1, #TL1_500US
+
+    CPL BUZZER
+
+    MOV A, BUZZ_L
+    JNZ DEC_BUZZ_LOW
+
+    DEC BUZZ_H
+
+DEC_BUZZ_LOW:
+    DEC BUZZ_L
+
+    MOV A, BUZZ_H
+    ORL A, BUZZ_L
+    JNZ FIM_TIMER1
+
+    CLR TR1
+    CLR BUZZER
+
+    LCALL REINICIA_CONCORRENTE
+
+FIM_TIMER1:
+    POP PSW
+    POP ACC
+    RETI
+
+;==============================================================
+; Tabela de respostas certas
+; 1=A, 2=B, 3=C, 4=D
+;==============================================================
+
+TABELA_RESPOSTAS:
+    DB 01H, 02H, 03H, 04H, 01H, 02H, 03H, 04H
+
+END
